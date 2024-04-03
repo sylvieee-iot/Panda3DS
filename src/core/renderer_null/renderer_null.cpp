@@ -1,5 +1,5 @@
 #include "renderer_null/renderer_null.hpp"
-
+#include "audio/dsp_shared_mem.hpp"
 RendererNull::RendererNull(GPU& gpu, const std::array<u32, regNum>& internalRegs, const std::array<u32, extRegNum>& externalRegs)
 	: Renderer(gpu, internalRegs, externalRegs) {}
 RendererNull::~RendererNull() {}
