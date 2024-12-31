@@ -2,6 +2,7 @@
 #include <teakra/disassembler.h>
 
 #include <array>
+#include <memory>
 
 #include "capstone.hpp"
 #include "emulator.hpp"
@@ -11,6 +12,8 @@
 extern "C" {
 #include "luv.h"
 }
+
+#include "external_haptics_manager.hpp"
 #endif
 
 void LuaManager::initialize() {
@@ -130,6 +133,32 @@ MAKE_MEMORY_FUNCTIONS(32)
 MAKE_MEMORY_FUNCTIONS(64)
 #undef MAKE_MEMORY_FUNCTIONS
 
+static int readFloatThunk(lua_State* L) {
+	const u32 vaddr = (u32)lua_tonumber(L, 1);
+	lua_pushnumber(L, (lua_Number)Helpers::bit_cast<float, u32>(LuaManager::g_emulator->getMemory().read32(vaddr)));
+	return 1;
+}
+
+static int writeFloatThunk(lua_State* L) {
+	const u32 vaddr = (u32)lua_tonumber(L, 1);
+	const float value = (float)lua_tonumber(L, 2);
+	LuaManager::g_emulator->getMemory().write32(vaddr, Helpers::bit_cast<u32, float>(value));
+	return 0;
+}
+
+static int readDoubleThunk(lua_State* L) {
+	const u32 vaddr = (u32)lua_tonumber(L, 1);
+	lua_pushnumber(L, (lua_Number)Helpers::bit_cast<double, u64>(LuaManager::g_emulator->getMemory().read64(vaddr)));
+	return 1;
+}
+
+static int writeDoubleThunk(lua_State* L) {
+	const u32 vaddr = (u32)lua_tonumber(L, 1);
+	const double value = (double)lua_tonumber(L, 2);
+	LuaManager::g_emulator->getMemory().write64(vaddr, Helpers::bit_cast<u64, double>(value));
+	return 0;
+}
+
 static int getAppIDThunk(lua_State* L) {
 	std::optional<u64> id = LuaManager::g_emulator->getMemory().getProgramID();
 	
@@ -242,16 +271,94 @@ static int disassembleTeakThunk(lua_State* L) {
 	return 1;
 }
 
+#ifndef __ANDROID__
+// Haptics functions
+
+namespace Haptics {
+	std::unique_ptr<ExternalHapticsManager> hapticsManager = nullptr;
+
+	static int initHapticsThunk(lua_State* L) {
+		if (hapticsManager == nullptr) {
+			hapticsManager.reset(new ExternalHapticsManager());
+		}
+
+		return 0;
+	}
+
+#define HAPTICS_THUNK(func)                \
+	static int func##Thunk(lua_State* L) { \
+		if (hapticsManager != nullptr) {   \
+			hapticsManager->func();        \
+		}                                  \
+                                           \
+		return 0;                          \
+	}
+
+	HAPTICS_THUNK(startScan)
+	HAPTICS_THUNK(stopScan)
+	HAPTICS_THUNK(connect)
+	HAPTICS_THUNK(requestDeviceList)
+	HAPTICS_THUNK(getDevices)
+	HAPTICS_THUNK(getSensors)
+	HAPTICS_THUNK(stopAllDevices)
+	#undef HAPTICS_THUNK
+
+	static int sendScalarThunk(lua_State* L) {
+		const int device = (int)lua_tonumber(L, 1);
+		const auto value = lua_tonumber(L, 2);  
+
+		if (hapticsManager != nullptr) {
+			hapticsManager->sendScalar(device, value);
+		}
+
+		return 2;
+	}
+
+	static int stopDeviceThunk(lua_State* L) {
+		const int device = (int)lua_tonumber(L, 1);
+
+		if (hapticsManager != nullptr) {
+			hapticsManager->stopDevice(device);
+		}
+
+		return 1;
+	}
+
+	// clang-format off
+	static constexpr luaL_Reg functions[] = {
+		{ "initHaptics", initHapticsThunk },
+		{ "startScan", startScanThunk },
+		{ "stopScan", stopScanThunk },
+		{ "connect", connectThunk },
+		{ "requestDeviceList", requestDeviceListThunk },
+		{ "getDevices", getDevicesThunk },
+		{ "getSensors", getSensorsThunk },
+		{ "stopAllDevices", stopAllDevicesThunk },
+		{ "sendScalar", sendScalarThunk },
+		{ "stopDevice", stopDeviceThunk },
+	};
+	// clang-format on
+
+	void registerFunctions(lua_State* L) {
+		luaL_register(L, "HAPTICS", functions);
+	}
+}  // namespace Haptics
+#endif
+
 // clang-format off
 static constexpr luaL_Reg functions[] = {
 	{ "__read8", read8Thunk },
 	{ "__read16", read16Thunk },
 	{ "__read32", read32Thunk },
 	{ "__read64", read64Thunk },
+	{ "__readFloat", readFloatThunk },
+	{ "__readDouble", readDoubleThunk },
 	{ "__write8", write8Thunk} ,
 	{ "__write16", write16Thunk },
 	{ "__write32", write32Thunk },
 	{ "__write64", write64Thunk },
+	{ "__writeFloat", writeFloatThunk },
+	{ "__writeDouble", writeDoubleThunk },
 	{ "__getAppID", getAppIDThunk },
 	{ "__pause", pauseThunk }, 
 	{ "__resume", resumeThunk },
@@ -273,10 +380,15 @@ void LuaManager::initializeThunks() {
 		read16 = function(addr) return GLOBALS.__read16(addr) end,
 		read32 = function(addr) return GLOBALS.__read32(addr) end,
 		read64 = function(addr) return GLOBALS.__read64(addr) end,
+		readFloat = function(addr) return GLOBALS.__readFloat(addr) end,
+		readDouble = function(addr) return GLOBALS.__readDouble(addr) end,
+
 		write8 = function(addr, value) GLOBALS.__write8(addr, value) end,
 		write16 = function(addr, value) GLOBALS.__write16(addr, value) end,
 		write32 = function(addr, value) GLOBALS.__write32(addr, value) end,
 		write64 = function(addr, value) GLOBALS.__write64(addr, value) end,
+		writeFloat = function(addr, value) GLOBALS.__writeFloat(addr, value) end,
+		writeDouble = function(addr, value) GLOBALS.__writeDouble(addr, value) end,
 
 		getAppID = function()
 			local ffi = require("ffi")
@@ -310,6 +422,20 @@ void LuaManager::initializeThunks() {
 		ButtonLeft = __ButtonLeft,
 		ButtonRight= __ButtonRight,
 	}
+
+	Buzz = {
+		initHaptics = function() HAPTICS.initHaptics() end,
+		startScan = function() HAPTICS.startScan() end,
+		stopScan = function() HAPTICS.stopScan() end,
+		connect = function() HAPTICS.connect() end,
+		requestDeviceList = function() HAPTICS.requestDeviceList() end,
+		getDevices = function() HAPTICS.getDevices() end,
+		getSensors = function() HAPTICS.getSensors() end,
+		stopAllDevices = function() HAPTICS.stopAllDevices() end,
+
+		sendScalar = function(device, value) HAPTICS.sendScalar(device, value) end,
+		stopDevice = function(device) HAPTICS.stopDevice(device) end,
+	}
 )";
 
 	auto addIntConstant = [&]<typename T>(T x, const char* name) {
@@ -318,6 +444,10 @@ void LuaManager::initializeThunks() {
 	};
 
 	luaL_register(L, "GLOBALS", functions);
+#ifndef __ANDROID__
+	Haptics::registerFunctions(L);
+#endif
+
 	// Add values for event enum
 	addIntConstant(LuaEvent::Frame, "__Frame");
 
